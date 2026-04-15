@@ -1,8 +1,10 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #02070f;
+  --foreground: #ebf6ff;
+  --page-glow-a: rgba(19, 101, 121, 0.28);
+  --page-glow-b: rgba(20, 74, 160, 0.18);
 }
 
 @theme inline {
@@ -10,17 +12,44 @@
   --color-foreground: var(--foreground);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+  --font-serif: var(--font-cinzel);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --background: #02070f;
+    --foreground: #ebf6ff;
   }
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-geist-sans), "Segoe UI", sans-serif;
+  min-height: 100vh;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 16% 18%, var(--page-glow-a), transparent 38%),
+    radial-gradient(circle at 78% 8%, var(--page-glow-b), transparent 42%),
+    linear-gradient(135deg, #02070f 0%, #05131f 45%, #0a1e30 100%);
+  z-index: -2;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: -1;
+  opacity: 0.18;
+  background-image:
+    linear-gradient(rgba(170, 240, 255, 0.15) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(170, 240, 255, 0.12) 1px, transparent 1px);
+  background-size: 36px 36px;
 }
