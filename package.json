@@ -11,6 +11,7 @@
   "dependencies": {
     "@mediapipe/hands": "^0.4.1675469240",
     "@types/qrcode": "^1.5.6",
+    "@vercel/kv": "^3.0.0",
     "next": "16.2.3",
     "qrcode": "^1.5.4",
     "react": "19.2.4",

@@ -174,6 +174,7 @@ export const useDuelWebRTC = ({
   const localStreamRef = useRef<MediaStream | null>(localStream ?? null);
   const addedLocalTrackIdsRef = useRef<Set<string>>(new Set());
   const remoteStreamRef = useRef<MediaStream | null>(null);
+  const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
 
   const { localAlias, remoteAlias } = useMemo(
     () => getDuelAliases(roomId, role),
@@ -216,7 +217,8 @@ export const useDuelWebRTC = ({
         body: JSON.stringify(body),
       });
       if (!response.ok) {
-        throw new Error(`Signaling request failed (${response.status}).`);
+        const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(payload?.error || `Signaling request failed (${response.status}).`);
       }
       return response.json();
     },
@@ -246,8 +248,34 @@ export const useDuelWebRTC = ({
       pcRef.current = null;
     }
     addedLocalTrackIdsRef.current.clear();
+    pendingIceCandidatesRef.current = [];
     remoteStreamRef.current = null;
     setRemoteStream(null);
+  }, []);
+
+  const waitForLocalStream = useCallback(async (timeoutMs = 1200): Promise<void> => {
+    const startedAt = Date.now();
+    while (!localStreamRef.current && Date.now() - startedAt < timeoutMs) {
+      await new Promise((resolve) => {
+        window.setTimeout(resolve, 60);
+      });
+    }
+  }, []);
+
+  const flushPendingIceCandidates = useCallback(async (pc: RTCPeerConnection): Promise<void> => {
+    if (!pc.remoteDescription || pendingIceCandidatesRef.current.length === 0) {
+      return;
+    }
+
+    const queued = [...pendingIceCandidatesRef.current];
+    pendingIceCandidatesRef.current = [];
+    for (const candidate of queued) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch {
+        // Ignore stale/bad candidates.
+      }
+    }
   }, []);
 
   const attachLocalTracks = useCallback((pc: RTCPeerConnection) => {
@@ -399,6 +427,7 @@ export const useDuelWebRTC = ({
     try {
       ensureHostDataChannel();
       const pc = setupPeerConnection();
+      await waitForLocalStream();
       attachLocalTracks(pc);
       pc.onicecandidate = (event) => {
         if (!event.candidate) {
@@ -422,7 +451,7 @@ export const useDuelWebRTC = ({
       setStatus("failed");
       setError("Unable to create host WebRTC offer.");
     }
-  }, [attachLocalTracks, enabled, ensureHostDataChannel, postSignal, role, roomId, sendIceCandidate, setupPeerConnection]);
+  }, [attachLocalTracks, enabled, ensureHostDataChannel, postSignal, role, roomId, sendIceCandidate, setupPeerConnection, waitForLocalStream]);
 
   const handleOffer = useCallback(
     async (eventPayload: unknown) => {
@@ -438,6 +467,7 @@ export const useDuelWebRTC = ({
       try {
         const offer = eventPayload as RTCSessionDescriptionInit;
         const pc = setupPeerConnection();
+        await waitForLocalStream();
         attachLocalTracks(pc);
         pc.onicecandidate = (event) => {
           if (!event.candidate) {
@@ -446,6 +476,7 @@ export const useDuelWebRTC = ({
           void sendIceCandidate(event.candidate.toJSON());
         };
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        await flushPendingIceCandidates(pc);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
 
@@ -464,7 +495,7 @@ export const useDuelWebRTC = ({
         processingOfferRef.current = false;
       }
     },
-    [attachLocalTracks, enabled, postSignal, role, roomId, sendIceCandidate, setupPeerConnection],
+    [attachLocalTracks, enabled, flushPendingIceCandidates, postSignal, role, roomId, sendIceCandidate, setupPeerConnection, waitForLocalStream],
   );
 
   const handleAnswer = useCallback(
@@ -481,6 +512,7 @@ export const useDuelWebRTC = ({
         const answer = eventPayload as RTCSessionDescriptionInit;
         const pc = setupPeerConnection();
         await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        await flushPendingIceCandidates(pc);
       } catch {
         setStatus("failed");
         setError("Unable to apply guest answer.");
@@ -488,7 +520,7 @@ export const useDuelWebRTC = ({
         processingAnswerRef.current = false;
       }
     },
-    [enabled, role, setupPeerConnection],
+    [enabled, flushPendingIceCandidates, role, setupPeerConnection],
   );
 
   const handleIceCandidate = useCallback(async (eventPayload: unknown) => {
@@ -504,6 +536,7 @@ export const useDuelWebRTC = ({
 
       const pc = setupPeerConnection();
       if (!pc.remoteDescription) {
+        pendingIceCandidatesRef.current.push(candidate);
         return;
       }
       await pc.addIceCandidate(new RTCIceCandidate(candidate));
@@ -527,7 +560,10 @@ export const useDuelWebRTC = ({
       );
 
       if (!response.ok) {
-        const error = new Error(`Polling failed (${response.status}).`) as SignalPollingError;
+        const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+        const error = new Error(
+          payload?.error || `Polling failed (${response.status}).`,
+        ) as SignalPollingError;
         if (response.status === 404) {
           error.code = "ROOM_NOT_FOUND";
         } else {
@@ -579,7 +615,7 @@ export const useDuelWebRTC = ({
 
       signalingFailureCountRef.current += 1;
       if (signalingFailureCountRef.current >= 3) {
-        setError("Temporary signaling issue. Reconnecting...");
+        setError(signalErr.message || "Temporary signaling issue. Reconnecting...");
         if (statusRef.current !== "connected") {
           setStatus("connecting");
         }

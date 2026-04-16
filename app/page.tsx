@@ -51,7 +51,8 @@ export default function Home() {
       });
 
       if (!response.ok) {
-        throw new Error("Unable to create room right now.");
+        const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(payload?.error || "Unable to create room right now.");
       }
 
       const data = (await response.json()) as CreateRoomResponse;
