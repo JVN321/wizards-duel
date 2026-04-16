@@ -19,9 +19,9 @@ const cinzel = Cinzel({
 });
 
 export const metadata: Metadata = {
-  title: "Wizards Duel - Spellcasting Interface",
+  title: "Wizard Duel — Motion Spellcasting Engine",
   description:
-    "Harry Potter-style spellcasting with real-time MediaPipe hand tracking and shape recognition.",
+    "Real-time motion gesture spell recognition using MediaPipe Hands. Cast Expelliarmus, Stupefy, Sectumsempra, and 7 more spells by moving your hand in the air.",
 };
 
 export default function RootLayout({
@@ -32,9 +32,9 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} ${cinzel.variable} h-full antialiased`}
+      className={`${geistSans.variable} ${geistMono.variable} ${cinzel.variable}`}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body>{children}</body>
     </html>
   );
 }

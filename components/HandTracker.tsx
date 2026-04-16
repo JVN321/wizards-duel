@@ -2,16 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CanvasOverlay } from "@/components/CanvasOverlay";
-import {
-  SettingsPanel,
-  type DrawingSettings,
-  type SpellUiSettings,
-} from "@/components/SettingsPanel";
-import {
-  SpellRecognizer,
-  type RecognitionSettings,
-  type SpellName,
-} from "@/components/SpellRecognizer";
+import { MotionRecognizer } from "@/components/MotionRecognizer";
 import {
   type TrackingFrame,
   type TrackingSettings,
@@ -23,12 +14,28 @@ import {
   smoothPath,
   type Point,
 } from "@/utils/gestureUtils";
+import { segmentPath, type MotionSegment } from "@/utils/motionGesture";
+import { getGameEngine, type GameState, type EngineEvent } from "@/utils/gameEngine";
+import type { SpellDefinition } from "@/utils/spellRegistry";
+import { getAllSpells } from "@/utils/spellRegistry";
 
-type SpellFeedback = {
-  name: SpellName;
-  score: number;
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type CastFeedback = {
+  spell: SpellDefinition;
+  confidence: number;
+  at: number;
+  source: "player" | "opponent";
+};
+
+type ToastMessage = {
+  id: string;
+  text: string;
+  color: string;
   at: number;
 };
+
+// ─── Constants ────────────────────────────────────────────────────────────────
 
 const DEFAULT_TRACKING: TrackingSettings = {
   detectionConfidence: 0.4,
@@ -37,126 +44,131 @@ const DEFAULT_TRACKING: TrackingSettings = {
   modelComplexity: 0,
 };
 
-const DEFAULT_DRAWING: DrawingSettings = {
-  smoothingFactor: 0.35,
-  minMovement: 8,
-  pauseDurationMs: 300,
-  predictionMs: 130,
-  showSkeleton: true,
-  showTrail: true,
-  trailColor: "#7de8ff",
-};
+const SPELL_TOAST_TTL = 2800;
+const FEEDBACK_TTL = 2600;
+const FLASH_DECAY_MS = 800;
 
-const DEFAULT_RECOGNITION: RecognitionSettings = {
-  shapeMatchingTolerance: 0.55,
-  minStrokeLength: 220,
-  resamplingResolution: 96,
-};
+// ─── Audio ────────────────────────────────────────────────────────────────────
 
-const DEFAULT_UI: SpellUiSettings = {
-  alwaysOn: true,
-};
-
-const spellColor: Record<SpellName, string> = {
-  Protego: "#8cf7ff",
-  Stupefy: "#ff7070",
-  Expelliarmus: "#ffbe5c",
-  "Expecto Patronum": "#9da7ff",
-};
-
-const playSpellTone = (spell: SpellName) => {
-  if (typeof window === "undefined") {
-    return;
-  }
-
+function playSpellTone(
+  frequencies: [number, number],
+  waveform: OscillatorType,
+  gainPeak = 0.07,
+): void {
+  if (typeof window === "undefined") return;
   const AudioContextClass = window.AudioContext;
-  if (!AudioContextClass) {
-    return;
-  }
+  if (!AudioContextClass) return;
 
-  const context = new AudioContextClass();
-  const master = context.createGain();
-  master.connect(context.destination);
-  master.gain.setValueAtTime(0.0001, context.currentTime);
-  master.gain.exponentialRampToValueAtTime(0.06, context.currentTime + 0.02);
-  master.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.35);
+  const ctx = new AudioContextClass();
+  const master = ctx.createGain();
+  master.connect(ctx.destination);
+  master.gain.setValueAtTime(0.0001, ctx.currentTime);
+  master.gain.exponentialRampToValueAtTime(gainPeak, ctx.currentTime + 0.03);
+  master.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.4);
 
-  const frequencyBySpell: Record<SpellName, [number, number]> = {
-    Protego: [420, 640],
-    Stupefy: [220, 160],
-    Expelliarmus: [520, 390],
-    "Expecto Patronum": [660, 880],
-  };
+  const osc = ctx.createOscillator();
+  osc.type = waveform;
+  osc.frequency.setValueAtTime(frequencies[0], ctx.currentTime);
+  osc.frequency.exponentialRampToValueAtTime(frequencies[1], ctx.currentTime + 0.38);
+  osc.connect(master);
+  osc.start();
+  osc.stop(ctx.currentTime + 0.45);
+  osc.onended = () => void ctx.close();
+}
 
-  const [startHz, endHz] = frequencyBySpell[spell];
-
-  const oscillator = context.createOscillator();
-  oscillator.type = "triangle";
-  oscillator.frequency.setValueAtTime(startHz, context.currentTime);
-  oscillator.frequency.exponentialRampToValueAtTime(endHz, context.currentTime + 0.32);
-  oscillator.connect(master);
-  oscillator.start();
-  oscillator.stop(context.currentTime + 0.38);
-
-  oscillator.onended = () => {
-    void context.close();
-  };
-};
+// ─── Component ────────────────────────────────────────────────────────────────
 
 export function HandTracker() {
-  const [tracking, setTracking] = useState(DEFAULT_TRACKING);
-  const [drawing, setDrawing] = useState(DEFAULT_DRAWING);
-  const [recognition, setRecognition] = useState(DEFAULT_RECOGNITION);
-  const [ui, setUi] = useState(DEFAULT_UI);
-
-  const recognizerRef = useRef(new SpellRecognizer());
+  // ── Refs ────────────────────────────────────────────────────────────────────
+  const recognizerRef = useRef(new MotionRecognizer());
+  const engineRef = useRef(getGameEngine());
   const trailRef = useRef<Point[]>([]);
   const velocityRef = useRef({ x: 0, y: 0 });
   const lastObservedPointRef = useRef<Point | null>(null);
   const lastObservedTimeRef = useRef<number | null>(null);
-  const dropoutStartRef = useRef<number | null>(null);
   const lastMovementAtRef = useRef<number>(0);
-  const pauseCastCooldownRef = useRef<number>(0);
-  const [trail, setTrail] = useState<Point[]>([]);
-  const [lastTrail, setLastTrail] = useState<Point[]>([]);
-  const [spell, setSpell] = useState<SpellFeedback | null>(null);
-  const [flashProgress, setFlashProgress] = useState(0);
+  const dropoutStartRef = useRef<number | null>(null);
 
-  const finalizeStroke = useCallback(
-    (rawTrail: Point[]) => {
-      if (rawTrail.length < 2) {
-        setTrail([]);
-        trailRef.current = [];
-        return;
+  // ── State ───────────────────────────────────────────────────────────────────
+  const [trail, setTrail] = useState<Point[]>([]);
+  const [segments, setSegments] = useState<MotionSegment[]>([]);
+  const [feedback, setFeedback] = useState<CastFeedback | null>(null);
+  const [flashProgress, setFlashProgress] = useState(0);
+  const [gameState, setGameState] = useState<GameState>(engineRef.current.getState());
+  const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const [showDebug, setShowDebug] = useState(false);
+  const [opponentCastFeedback, setOpponentCastFeedback] = useState<SpellDefinition | null>(null);
+
+  // ── Game engine subscription ─────────────────────────────────────────────
+  useEffect(() => {
+    const engine = engineRef.current;
+
+    const unsub = engine.subscribe((event: EngineEvent) => {
+      if (event.type === "state_change") {
+        setGameState({ ...event.state });
       }
 
-      const cleaned = filterByMinDistance(rawTrail, drawing.minMovement * 0.6);
-      if (cleaned.length > 3) {
-        const smoothed = smoothPath(cleaned, drawing.smoothingFactor);
-        const match = recognizerRef.current.recognize(smoothed, recognition);
-        setLastTrail(smoothed);
+      if (event.type === "spell_cast") {
+        // handled in handleTrackingFrame
+      }
 
-        if (match) {
-          const nextSpell = {
-            name: match.spell,
-            score: match.score,
-            at: Date.now(),
-          };
-          setSpell(nextSpell);
-          playSpellTone(match.spell);
+      if (event.type === "opponent_cast") {
+        const spellDef = getAllSpells().find((s: SpellDefinition) => s.id === event.spellId);
+        if (spellDef) {
+          setOpponentCastFeedback(spellDef);
+          addToast(`⚔️ ${spellDef.displayName}!`, spellDef.color);
+          setTimeout(() => setOpponentCastFeedback(null), 2000);
         }
       }
 
-      setTrail([]);
-      trailRef.current = [];
-      velocityRef.current = { x: 0, y: 0 };
-      lastObservedPointRef.current = null;
-      lastObservedTimeRef.current = null;
-      dropoutStartRef.current = null;
-    },
-    [drawing.minMovement, drawing.smoothingFactor, recognition],
-  );
+      if (event.type === "combo") {
+        addToast(`🔥 ×${event.count} Combo! ×${event.multiplier.toFixed(2)} damage`, "#ffeaa7");
+      }
 
+      if (event.type === "game_over") {
+        addToast(
+          event.winner === "player" ? "🏆 Victory!" : "💀 Defeated!",
+          event.winner === "player" ? "#55efc4" : "#ff6b6b",
+        );
+      }
+    });
+
+    return unsub;
+  }, []);
+
+  // ── Auto-start duel on mount ─────────────────────────────────────────────
+  useEffect(() => {
+    const engine = engineRef.current;
+    if (engine.getState().phase === "idle") {
+      setTimeout(() => engine.startDuel(), 1200);
+    }
+  }, []);
+
+  // ── Flash animation ──────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!feedback) return;
+    let frame = 0;
+    const tick = () => {
+      const elapsed = Date.now() - feedback.at;
+      const next = Math.max(0, 1 - elapsed / FLASH_DECAY_MS);
+      setFlashProgress(next);
+      if (elapsed > FEEDBACK_TTL) { setFeedback(null); return; }
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [feedback]);
+
+  // ── Toast helper ─────────────────────────────────────────────────────────
+  const addToast = useCallback((text: string, color: string) => {
+    const id = `${Date.now()}_${Math.random()}`;
+    setToasts((prev) => [...prev.slice(-4), { id, text, color, at: Date.now() }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, SPELL_TOAST_TTL);
+  }, []);
+
+  // ── Tracking frame handler ───────────────────────────────────────────────
   const handleTrackingFrame = useCallback(
     ({
       gesture: frameGesture,
@@ -164,37 +176,40 @@ export function HandTracker() {
       timestamp,
       videoSize: frameVideoSize,
     }: TrackingFrame) => {
+      const recognizer = recognizerRef.current;
+      const engine = engineRef.current;
+
+      // Update landmarks for pose detection (Protego Maxima)
+      if (frameLandmarks) {
+        recognizer.updateLandmarks(frameLandmarks, timestamp);
+      }
+
       const tip = frameGesture.drawTip;
+
       if (!tip || !frameLandmarks) {
-        const lastObserved = lastObservedPointRef.current;
-        const lastObservedAt = lastObservedTimeRef.current;
+        // Prediction window during hand dropout
+        const lastObs = lastObservedPointRef.current;
+        const lastObsAt = lastObservedTimeRef.current;
+        const predMs = 120;
 
-        if (lastObserved && lastObservedAt) {
-          const elapsedDropout = timestamp - lastObservedAt;
-          const predictionWindow = drawing.predictionMs;
-
-          if (elapsedDropout <= predictionWindow) {
-            const dt = elapsedDropout / 1000;
-            const damping = Math.max(0.2, 1 - elapsedDropout / (predictionWindow * 1.35));
+        if (lastObs && lastObsAt) {
+          const elapsed = timestamp - lastObsAt;
+          if (elapsed <= predMs) {
+            const dt = elapsed / 1000;
+            const damp = Math.max(0.2, 1 - elapsed / (predMs * 1.35));
             const predicted: Point = {
-              x: lastObserved.x + velocityRef.current.x * dt * damping,
-              y: lastObserved.y + velocityRef.current.y * dt * damping,
+              x: lastObs.x + velocityRef.current.x * dt * damp,
+              y: lastObs.y + velocityRef.current.y * dt * damp,
               t: timestamp,
             };
-
+            recognizer.feed(predicted);
             setTrail((prev) => {
-              const previous = prev[prev.length - 1];
-              if (!previous) {
-                trailRef.current = [predicted];
-                return [predicted];
-              }
-
-              if (distance(previous, predicted) >= drawing.minMovement * 0.45) {
-                const next = [...prev, predicted].slice(-900);
+              const last = prev[prev.length - 1];
+              if (!last || distance(last, predicted) >= 5) {
+                const next = [...prev, predicted].slice(-800);
                 trailRef.current = next;
                 return next;
               }
-
               return prev;
             });
             return;
@@ -203,14 +218,6 @@ export function HandTracker() {
 
         if (dropoutStartRef.current === null) {
           dropoutStartRef.current = timestamp;
-        }
-
-        const currentTrail = trailRef.current;
-        if (
-          currentTrail.length > 2 &&
-          timestamp - lastMovementAtRef.current >= drawing.pauseDurationMs
-        ) {
-          finalizeStroke(currentTrail);
         }
         return;
       }
@@ -223,212 +230,378 @@ export function HandTracker() {
         t: timestamp,
       };
 
-      const previousObserved = lastObservedPointRef.current;
-      const previousObservedAt = lastObservedTimeRef.current;
-      if (previousObserved && previousObservedAt) {
-        const dtSeconds = Math.max(1e-3, (timestamp - previousObservedAt) / 1000);
-        const instantVx = (point.x - previousObserved.x) / dtSeconds;
-        const instantVy = (point.y - previousObserved.y) / dtSeconds;
+      // Update velocity estimate
+      const prevObs = lastObservedPointRef.current;
+      const prevObsAt = lastObservedTimeRef.current;
+      if (prevObs && prevObsAt) {
+        const dtSec = Math.max(1e-3, (timestamp - prevObsAt) / 1000);
+        const ivx = (point.x - prevObs.x) / dtSec;
+        const ivy = (point.y - prevObs.y) / dtSec;
         velocityRef.current = {
-          x: velocityRef.current.x * 0.6 + instantVx * 0.4,
-          y: velocityRef.current.y * 0.6 + instantVy * 0.4,
+          x: velocityRef.current.x * 0.6 + ivx * 0.4,
+          y: velocityRef.current.y * 0.6 + ivy * 0.4,
         };
       }
       lastObservedPointRef.current = point;
       lastObservedTimeRef.current = timestamp;
+      lastMovementAtRef.current = timestamp;
+
+      // Feed into recognizer and update trail
+      recognizer.feed(point);
 
       setTrail((prev) => {
-        if (!prev.length) {
-          const next = [point];
+        const last = prev[prev.length - 1];
+        if (!last || distance(last, point) >= 6) {
+          const next = [...prev, point].slice(-800);
           trailRef.current = next;
-          lastMovementAtRef.current = timestamp;
           return next;
         }
-
-        const previous = prev[prev.length - 1];
-        if (distance(previous, point) >= drawing.minMovement) {
-          const next = [...prev, point].slice(-900);
-          trailRef.current = next;
-          lastMovementAtRef.current = timestamp;
-          return next;
-        }
-
-        if (
-          timestamp - lastMovementAtRef.current >= drawing.pauseDurationMs &&
-          prev.length >= 4 &&
-          timestamp > pauseCastCooldownRef.current
-        ) {
-          const captured = [...prev];
-          pauseCastCooldownRef.current = timestamp + 250;
-          finalizeStroke(captured);
-          return [];
-        }
-
         return prev;
       });
-    },
-    [
-      drawing.minMovement,
-      drawing.pauseDurationMs,
-      drawing.predictionMs,
-      finalizeStroke,
-    ],
-  );
 
-  const { videoRef, landmarks, gesture, fps, isReady, error, videoSize } =
-    useHandTracking(tracking, handleTrackingFrame);
+      // ── Continuous real-time recognition ─────────────────────────────────
+      const match = recognizer.recognize(frameLandmarks ?? []);
 
-  useEffect(() => {
-    if (!spell) {
-      return;
-    }
+      if (match) {
+        const spell = match.spell;
+        const cast = engine.castSpell(spell.id, match.confidence);
 
-    let frame = 0;
-    const tick = () => {
-      const elapsed = Date.now() - spell.at;
-      const next = Math.max(0, 1 - elapsed / 800);
-      setFlashProgress(next);
-
-      if (elapsed > 2600) {
-        setSpell(null);
-        return;
+        if (cast) {
+          setFeedback({
+            spell,
+            confidence: match.confidence,
+            at: Date.now(),
+            source: "player",
+          });
+          setTrail([]);
+          trailRef.current = [];
+          recognizer.clearTrail();
+          playSpellTone(spell.soundFrequencies, spell.soundWave);
+          addToast(`✨ ${spell.displayName}`, spell.color);
+        }
       }
 
-      frame = window.requestAnimationFrame(tick);
-    };
+      // Update debug segments
+      const currentTrail = recognizer.getTrail();
+      if (currentTrail.length > 6) {
+        const cleaned = filterByMinDistance(currentTrail, 5);
+        const smoothed = smoothPath(cleaned, 0.4);
+        const segs = segmentPath(smoothed);
+        setSegments(segs);
+      } else {
+        setSegments([]);
+      }
+    },
+    [addToast],
+  );
 
-    frame = window.requestAnimationFrame(tick);
+  // ── Tracking hook ────────────────────────────────────────────────────────
+  const { videoRef, landmarks, gesture, fps, isReady, error, videoSize } =
+    useHandTracking(DEFAULT_TRACKING, handleTrackingFrame);
 
-    return () => {
-      window.cancelAnimationFrame(frame);
-    };
-  }, [spell]);
-
+  // ── Render path ──────────────────────────────────────────────────────────
   const renderPath = useMemo(() => {
-    const source = trail.length ? trail : lastTrail;
-    const smoothed = smoothPath(source, drawing.smoothingFactor);
-    return smoothed;
-  }, [drawing.smoothingFactor, lastTrail, trail]);
+    const cleaned = filterByMinDistance(trail, 4);
+    return smoothPath(cleaned, 0.4);
+  }, [trail]);
+
+  const activeSpellColor = feedback?.spell.color ?? null;
+
+  // ── Clear handler ────────────────────────────────────────────────────────
+  const handleClear = useCallback(() => {
+    setTrail([]);
+    trailRef.current = [];
+    recognizerRef.current.clearTrail();
+    setSegments([]);
+    velocityRef.current = { x: 0, y: 0 };
+    lastObservedPointRef.current = null;
+    lastObservedTimeRef.current = null;
+    dropoutStartRef.current = null;
+    setFeedback(null);
+    setFlashProgress(0);
+  }, []);
 
   return (
-    <div className="mx-auto flex w-full max-w-[1380px] flex-col gap-6 px-4 py-6 lg:px-8">
-      <header className="flex flex-col gap-2">
-        <p className="text-xs uppercase tracking-[0.24em] text-cyan-200/85">Wizards Duel Lab</p>
-        <h1 className="font-serif text-3xl text-cyan-50 sm:text-4xl">Air Spellcasting Interface</h1>
-        <p className="max-w-3xl text-sm text-slate-200/80 sm:text-base">
-          Draw in the air using your index fingertip and cast spells from shape recognition.
-          Hand tracking is always on, with short dropout prediction to smooth jitter.
-        </p>
-      </header>
+    <div className="duel-root">
+      {/* ── Video / Canvas area ── */}
+      <div className="video-section">
+        <div className="video-inner">
+          <div className="video-frame">
+            <video
+              ref={videoRef}
+              className="video-el"
+              style={{ transform: "scaleX(-1)" }}
+              autoPlay
+              muted
+              playsInline
+            />
 
-      <div className="grid gap-5 lg:grid-cols-[1fr_320px]">
-        <section className="relative overflow-hidden rounded-3xl border border-cyan-100/20 bg-slate-950/60 shadow-[0_0_0_1px_rgba(180,255,255,0.06),0_18px_70px_rgba(0,0,0,0.5)]">
-          <div className="relative mx-auto w-full max-w-[1200px]">
-            <div className="relative aspect-video w-full bg-slate-900">
-              <video
-                ref={videoRef}
-                className="absolute inset-0 h-full w-full object-cover"
-                style={{ transform: "scaleX(-1)" }}
-                autoPlay
-                muted
-                playsInline
+            <div style={{ transform: "scaleX(-1)" }} className="canvas-wrap">
+              <CanvasOverlay
+                sourceWidth={videoSize.width}
+                sourceHeight={videoSize.height}
+                landmarks={landmarks}
+                path={renderPath}
+                showSkeleton
+                showTrail
+                showDebug={showDebug}
+                active={Boolean(gesture.drawTip)}
+                trailColor={feedback ? feedback.spell.color : "#7de8ff"}
+                spellColor={activeSpellColor}
+                spellFlashProgress={flashProgress}
+                segments={segments}
               />
+            </div>
 
-              <div style={{ transform: "scaleX(-1)" }} className="absolute inset-0">
-                <CanvasOverlay
-                  sourceWidth={videoSize.width}
-                  sourceHeight={videoSize.height}
-                  landmarks={landmarks}
-                  path={renderPath}
-                  showSkeleton={drawing.showSkeleton}
-                  showTrail={drawing.showTrail}
-                  active={Boolean(gesture.drawTip)}
-                  trailColor={drawing.trailColor}
-                  spellName={spell?.name ?? null}
-                  spellFlashProgress={flashProgress}
-                />
+            {!isReady && !error && (
+              <div className="overlay-center">
+                <p className="init-text">Initializing MediaPipe…</p>
               </div>
+            )}
+            {error && (
+              <div className="overlay-center overlay-error">
+                <p className="error-title">Camera Failed</p>
+                <p className="error-body">{error}</p>
+              </div>
+            )}
 
-              {!isReady && !error ? (
-                <div className="absolute inset-0 grid place-items-center bg-slate-950/75 text-cyan-100">
-                  <p className="animate-pulse text-sm tracking-wide">Initializing MediaPipe...</p>
-                </div>
-              ) : null}
+            {/* Spell cast burst */}
+            {feedback && (
+              <div
+                className="spell-burst"
+                style={{ "--spell-color": feedback.spell.color } as React.CSSProperties}
+              >
+                <span className="spell-burst-name">{feedback.spell.displayName}</span>
+                <span className="spell-burst-conf">
+                  {(feedback.confidence * 100).toFixed(0)}% confidence
+                </span>
+              </div>
+            )}
 
-              {error ? (
-                <div className="absolute inset-0 grid place-items-center bg-red-950/80 p-6 text-center text-red-100">
-                  <div>
-                    <p className="text-lg font-semibold">Camera Initialization Failed</p>
-                    <p className="mt-2 text-sm text-red-200/90">{error}</p>
-                    <p className="mt-3 text-xs text-red-100/85">
-                      Check browser camera permissions and refresh.
-                    </p>
-                  </div>
-                </div>
-              ) : null}
+            {/* Opponent cast flash */}
+            {opponentCastFeedback && (
+              <div className="opponent-cast-badge">
+                <span>⚔️ {opponentCastFeedback.displayName}</span>
+              </div>
+            )}
+
+            {/* FPS badge */}
+            <div className="fps-badge">{fps} FPS</div>
+
+            {/* Controls bar */}
+            <div className="controls-bar">
+              <button
+                type="button"
+                onClick={handleClear}
+                className="btn-clear"
+              >
+                Clear
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowDebug((v) => !v)}
+                className={`btn-debug ${showDebug ? "btn-debug-on" : ""}`}
+              >
+                Debug {showDebug ? "ON" : "OFF"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  engineRef.current.startDuel();
+                  handleClear();
+                }}
+                className="btn-restart"
+              >
+                Restart Duel
+              </button>
             </div>
           </div>
-
-          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-cyan-100/10 bg-slate-950/80 px-4 py-3 text-sm text-cyan-100/90">
-            <div className="flex flex-wrap items-center gap-4">
-              <span className="rounded-full border border-cyan-100/20 px-3 py-1 text-xs uppercase tracking-[0.14em]">
-                {fps} FPS
-              </span>
-              <span className="text-xs uppercase tracking-[0.14em] text-cyan-200/85">
-                Tracking: Hand (1)
-              </span>
-              <span className="text-xs uppercase tracking-[0.14em] text-cyan-200/85">
-                Pause Cast: {drawing.pauseDurationMs}ms | Predict: {drawing.predictionMs}ms
-              </span>
-            </div>
-            <button
-              type="button"
-              onClick={() => {
-                setTrail([]);
-                trailRef.current = [];
-                velocityRef.current = { x: 0, y: 0 };
-                lastObservedPointRef.current = null;
-                lastObservedTimeRef.current = null;
-                dropoutStartRef.current = null;
-                lastMovementAtRef.current = 0;
-                setLastTrail([]);
-                setSpell(null);
-                setFlashProgress(0);
-              }}
-              className="rounded-full border border-cyan-200/35 px-4 py-1.5 text-xs font-semibold uppercase tracking-[0.15em] text-cyan-100 transition hover:bg-cyan-100/10"
-            >
-              Clear Path
-            </button>
-          </div>
-
-          <div className="pointer-events-none absolute left-4 top-4 rounded-xl border border-cyan-200/20 bg-slate-900/70 px-3 py-2 text-sm text-cyan-100 shadow-lg backdrop-blur">
-            <p className="text-[11px] uppercase tracking-[0.18em] text-cyan-200/80">Detected Spell</p>
-            <p
-              className="mt-1 font-serif text-xl tracking-wide"
-              style={{
-                color: spell ? spellColor[spell.name] : "#cdeef9",
-                textShadow: spell ? `0 0 14px ${spellColor[spell.name]}` : "none",
-              }}
-            >
-              {spell ? spell.name : "None"}
-            </p>
-            <p className="text-[11px] text-cyan-100/70">
-              {spell ? `Confidence: ${(spell.score * 100).toFixed(0)}%` : "Draw and release to cast"}
-            </p>
-          </div>
-        </section>
-
-        <SettingsPanel
-          tracking={tracking}
-          drawing={drawing}
-          recognition={recognition}
-          ui={ui}
-          onTrackingChange={setTracking}
-          onDrawingChange={setDrawing}
-          onRecognitionChange={setRecognition}
-          onUiChange={setUi}
-        />
+        </div>
       </div>
+
+      {/* ── Right panel ─────────────────────────────────────────────────── */}
+      <aside className="side-panel">
+        <header className="panel-header">
+          <h1 className="duel-title">Wizard's Duel</h1>
+          <p className="duel-subtitle">Motion Recognition Engine</p>
+        </header>
+
+        {/* Health bars */}
+        <HealthBars gameState={gameState} />
+
+        {/* Combo meter */}
+        <ComboMeter gameState={gameState} />
+
+        {/* Spell Grid */}
+        <SpellGrid gameState={gameState} currentFeedback={feedback} />
+
+        {/* Active effects */}
+        <EffectList gameState={gameState} />
+      </aside>
+
+      {/* ── Toast notifications ── */}
+      <div className="toast-stack">
+        {toasts.map((t) => (
+          <div
+            key={t.id}
+            className="toast-item"
+            style={{ borderColor: t.color, color: t.color }}
+          >
+            {t.text}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Sub-components ───────────────────────────────────────────────────────────
+
+function HealthBars({ gameState }: { gameState: GameState }) {
+  const { player, opponent } = gameState;
+  const playerPct = (player.hp / player.maxHp) * 100;
+  const opponentPct = (opponent.hp / opponent.maxHp) * 100;
+
+  return (
+    <div className="health-section">
+      <div className="fighter-row">
+        <span className="fighter-name">{player.name}</span>
+        <span className="hp-text">{player.hp}/{player.maxHp}</span>
+      </div>
+      <div className="hp-bar-bg">
+        <div
+          className="hp-bar-fill hp-player"
+          style={{ width: `${playerPct}%` }}
+        />
+        {player.shieldStrength > 0 && (
+          <div
+            className="shield-fill"
+            style={{ width: `${player.shieldStrength}%` }}
+          />
+        )}
+      </div>
+
+      <div className="fighter-row mt-2">
+        <span className="fighter-name">{opponent.name}</span>
+        <span className="hp-text">{opponent.hp}/{opponent.maxHp}</span>
+      </div>
+      <div className="hp-bar-bg">
+        <div
+          className="hp-bar-fill hp-opponent"
+          style={{ width: `${opponentPct}%` }}
+        />
+        {opponent.shieldStrength > 0 && (
+          <div
+            className="shield-fill"
+            style={{ width: `${opponent.shieldStrength}%` }}
+          />
+        )}
+      </div>
+
+      {gameState.score > 0 && (
+        <div className="score-badge">Score: {gameState.score}</div>
+      )}
+
+      {gameState.phase === "victory" && (
+        <div className="phase-badge phase-win">🏆 Victory!</div>
+      )}
+      {gameState.phase === "defeat" && (
+        <div className="phase-badge phase-loss">💀 Defeated</div>
+      )}
+    </div>
+  );
+}
+
+function ComboMeter({ gameState }: { gameState: GameState }) {
+  const recent = gameState.combo.filter(
+    (c) => Date.now() - c.castedAt < 3500,
+  );
+  const count = recent.length;
+  if (count < 2) return null;
+
+  const multiplier = count < 3 ? 1.25 : count < 5 ? 1.5 : 2.0;
+
+  return (
+    <div className="combo-meter">
+      <span className="combo-fire">🔥</span>
+      <span className="combo-count">×{count} Combo</span>
+      <span className="combo-mult">×{multiplier.toFixed(2)}</span>
+    </div>
+  );
+}
+
+function SpellGrid({
+  gameState,
+  currentFeedback,
+}: {
+  gameState: GameState;
+  currentFeedback: CastFeedback | null;
+}) {
+  const allSpells = getAllSpells();
+  const now = Date.now();
+
+  return (
+    <div className="spell-grid-wrap">
+      <h3 className="panel-heading">Spells</h3>
+      <div className="spell-grid">
+        {allSpells.map((spell) => {
+          const cooldownAt = gameState.cooldowns[spell.id] ?? 0;
+          const onCd = now < cooldownAt;
+          const cdPct = onCd
+            ? ((cooldownAt - now) / spell.cooldownMs) * 100
+            : 0;
+          const isActive = currentFeedback?.spell.id === spell.id;
+
+          return (
+            <div
+              key={spell.id}
+              className={`spell-card ${isActive ? "spell-card-active" : ""} ${onCd ? "spell-card-cd" : ""}`}
+              style={
+                {
+                  "--spell-c": spell.color,
+                  "--spell-a": spell.accentColor,
+                  "--cd-pct": `${cdPct}%`,
+                } as React.CSSProperties
+              }
+              title={`${spell.description}\nGesture: ${spell.gestureHint}`}
+            >
+              <div className="spell-card-name">{spell.displayName}</div>
+              <div className="spell-card-cat">{spell.category}</div>
+              <div className="spell-card-hint">{spell.gestureHint}</div>
+              {onCd && <div className="spell-cd-bar" />}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function EffectList({ gameState }: { gameState: GameState }) {
+  const now = Date.now();
+  const allEffects = [
+    ...gameState.player.effects.map((e) => ({ ...e, target: "You" })),
+    ...gameState.opponent.effects.map((e) => ({ ...e, target: "Opponent" })),
+  ].filter((e) => now - e.startedAt < e.durationMs);
+
+  if (allEffects.length === 0) return null;
+
+  return (
+    <div className="effect-list">
+      <h3 className="panel-heading">Active Effects</h3>
+      {allEffects.map((e) => {
+        const remaining = Math.max(0, e.durationMs - (now - e.startedAt));
+        const pct = (remaining / e.durationMs) * 100;
+        return (
+          <div key={e.id} className="effect-row">
+            <span className="effect-target">{e.target}</span>
+            <span className="effect-status">{e.status}</span>
+            <div className="effect-bar-bg">
+              <div className="effect-bar-fill" style={{ width: `${pct}%` }} />
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
