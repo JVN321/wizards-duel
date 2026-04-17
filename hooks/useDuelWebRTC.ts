@@ -2,13 +2,20 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { SpellId } from "@/utils/spellRegistry";
+import {
+  createThrottle,
+  decodePeerMessage,
+  encodePeerMessage,
+  type MotionDataEvent,
+  type PeerEvent,
+  type Role,
+} from "@/utils/networkManager";
+import {
+  deriveConnectionState,
+  type ConnectionState,
+} from "@/utils/connectionState";
+import { LatencyTracker, getLatencyQuality } from "@/utils/latencyTracker";
 
-type Role = "host" | "guest";
-
-type PeerMessage =
-  | { type: "cast"; spellId: SpellId }
-  | { type: "restart" }
-  | { type: "state_sync"; state: unknown };
 
 type SignalEvent = {
   id: number;
@@ -31,9 +38,10 @@ type UseDuelWebRTCOptions = {
   role: Role;
   enabled: boolean;
   localStream?: MediaStream | null;
-  onPeerCast: (spellId: SpellId) => void;
+  onPeerCast: (spellId: SpellId, confidence?: number) => void;
   onPeerRestart?: () => void;
   onPeerStateSync?: (state: unknown) => void;
+  onPeerMotion?: (motion: MotionDataEvent) => void;
 };
 
 type PeerStatus = "idle" | "waiting" | "connecting" | "connected" | "failed";
@@ -88,78 +96,34 @@ const RTC_CONFIG: RTCConfiguration = {
 };
 
 const SIGNAL_POLL_MS = 350;
-const OUTBOUND_VIDEO_MAX_BITRATE_BPS = 170_000;
-const OUTBOUND_VIDEO_MAX_FPS = 15;
-const OUTBOUND_VIDEO_SCALE_DOWN_BY = 2;
-
-const tuneOutboundVideoSender = async (sender: RTCRtpSender): Promise<void> => {
-  if (!sender.track || sender.track.kind !== "video") {
-    return;
-  }
-
-  const params = sender.getParameters();
-  const encodings = params.encodings && params.encodings.length > 0 ? params.encodings : [{}];
-  encodings[0] = {
-    ...encodings[0],
-    maxBitrate: OUTBOUND_VIDEO_MAX_BITRATE_BPS,
-    maxFramerate: OUTBOUND_VIDEO_MAX_FPS,
-    scaleResolutionDownBy: OUTBOUND_VIDEO_SCALE_DOWN_BY,
-  };
-
-  params.encodings = encodings;
-  await sender.setParameters(params);
-};
-
-const safeParseMessage = (raw: string): PeerMessage | null => {
-  try {
-    const payload = JSON.parse(raw);
-    if (!payload || typeof payload !== "object") {
-      return null;
-    }
-
-    const type = (payload as { type?: string }).type;
-    if (type === "cast") {
-      const spellId = (payload as { spellId?: string }).spellId;
-      if (typeof spellId === "string") {
-        return { type: "cast", spellId: spellId as SpellId };
-      }
-      return null;
-    }
-
-    if (type === "restart") {
-      return { type: "restart" };
-    }
-
-    if (type === "state_sync") {
-      return {
-        type: "state_sync",
-        state: (payload as { state?: unknown }).state,
-      };
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-};
+const PING_INTERVAL_MS = 2500;
+const MOTION_SEND_INTERVAL_MS = 66; // ~15 updates/s
+const STATE_SYNC_INTERVAL_MS = 75;
 
 export const useDuelWebRTC = ({
   roomId,
   role,
   enabled,
-  localStream,
   onPeerCast,
   onPeerRestart,
   onPeerStateSync,
+  onPeerMotion,
 }: UseDuelWebRTCOptions) => {
   const [status, setStatus] = useState<PeerStatus>(enabled ? "waiting" : "idle");
   const [error, setError] = useState<string | null>(null);
   const [hostPresent, setHostPresent] = useState(false);
   const [guestPresent, setGuestPresent] = useState(false);
-  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [localReady, setLocalReady] = useState(false);
+  const [remoteReady, setRemoteReady] = useState(false);
+  const [inGame, setInGame] = useState(false);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
+  const [connectionState, setConnectionState] = useState<ConnectionState>(
+    enabled ? "CONNECTING" : "DISCONNECTED",
+  );
 
   const cursorRef = useRef(0);
   const pollTimerRef = useRef<number | null>(null);
+  const pingTimerRef = useRef<number | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const channelRef = useRef<RTCDataChannel | null>(null);
   const processingOfferRef = useRef(false);
@@ -171,15 +135,40 @@ export const useDuelWebRTC = ({
   const onPeerCastRef = useRef(onPeerCast);
   const onPeerRestartRef = useRef(onPeerRestart);
   const onPeerStateSyncRef = useRef(onPeerStateSync);
-  const localStreamRef = useRef<MediaStream | null>(localStream ?? null);
-  const addedLocalTrackIdsRef = useRef<Set<string>>(new Set());
-  const remoteStreamRef = useRef<MediaStream | null>(null);
+  const onPeerMotionRef = useRef(onPeerMotion);
   const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const hasPeerTransportRef = useRef(false);
+  const localReadyRef = useRef(false);
+  const remoteReadyRef = useRef(false);
+  const inGameRef = useRef(false);
+  const latencyTrackerRef = useRef(new LatencyTracker());
+  const throttleMotionRef = useRef(createThrottle(MOTION_SEND_INTERVAL_MS));
+  const throttleStateSyncRef = useRef(createThrottle(STATE_SYNC_INTERVAL_MS));
 
   const { localAlias, remoteAlias } = useMemo(
     () => getDuelAliases(roomId, role),
     [roomId, role],
   );
+
+  const inviteUrl = useMemo(() => {
+    if (typeof window === "undefined") {
+      return "";
+    }
+    const origin = window.location.origin;
+    return `${origin}/duel/${roomId}?role=guest`;
+  }, [roomId]);
+
+  const updateConnectionState = useCallback(() => {
+    setConnectionState(
+      deriveConnectionState({
+        enabled,
+        hasPeerTransport: hasPeerTransportRef.current,
+        localReady: localReadyRef.current,
+        remoteReady: remoteReadyRef.current,
+        inGame: inGameRef.current,
+      }),
+    );
+  }, [enabled]);
 
   useEffect(() => {
     statusRef.current = status;
@@ -198,16 +187,8 @@ export const useDuelWebRTC = ({
   }, [onPeerStateSync]);
 
   useEffect(() => {
-    localStreamRef.current = localStream ?? null;
-  }, [localStream]);
-
-  const inviteUrl = useMemo(() => {
-    if (typeof window === "undefined") {
-      return "";
-    }
-    const origin = window.location.origin;
-    return `${origin}/duel/${roomId}?role=guest`;
-  }, [roomId]);
+    onPeerMotionRef.current = onPeerMotion;
+  }, [onPeerMotion]);
 
   const postSignal = useCallback(
     async (body: Record<string, unknown>) => {
@@ -247,19 +228,8 @@ export const useDuelWebRTC = ({
       pcRef.current.close();
       pcRef.current = null;
     }
-    addedLocalTrackIdsRef.current.clear();
+    hasPeerTransportRef.current = false;
     pendingIceCandidatesRef.current = [];
-    remoteStreamRef.current = null;
-    setRemoteStream(null);
-  }, []);
-
-  const waitForLocalStream = useCallback(async (timeoutMs = 1200): Promise<void> => {
-    const startedAt = Date.now();
-    while (!localStreamRef.current && Date.now() - startedAt < timeoutMs) {
-      await new Promise((resolve) => {
-        window.setTimeout(resolve, 60);
-      });
-    }
   }, []);
 
   const flushPendingIceCandidates = useCallback(async (pc: RTCPeerConnection): Promise<void> => {
@@ -278,25 +248,74 @@ export const useDuelWebRTC = ({
     }
   }, []);
 
-  const attachLocalTracks = useCallback((pc: RTCPeerConnection) => {
-    const stream = localStreamRef.current;
-    if (!stream) {
+  const sendPeerEvent = useCallback((event: PeerEvent): boolean => {
+    const channel = channelRef.current;
+    if (!channel || channel.readyState !== "open") {
+      return false;
+    }
+
+    channel.send(encodePeerMessage(role, event));
+    return true;
+  }, [role]);
+
+  const applyTransportReady = useCallback(() => {
+    hasPeerTransportRef.current = true;
+    setStatus("connected");
+    setError(null);
+    signalingFailureCountRef.current = 0;
+    updateConnectionState();
+  }, [updateConnectionState]);
+
+  const handlePeerMessage = useCallback((raw: string) => {
+    const parsed = decodePeerMessage(raw);
+    if (!parsed) {
       return;
     }
 
-    for (const track of stream.getTracks()) {
-      if (addedLocalTrackIdsRef.current.has(track.id)) {
-        continue;
-      }
-      const sender = pc.addTrack(track, stream);
-      addedLocalTrackIdsRef.current.add(track.id);
-      if (track.kind === "video") {
-        void tuneOutboundVideoSender(sender).catch(() => {
-          // Some browsers may reject sender params; ignore to keep call healthy.
-        });
-      }
+    const { payload } = parsed;
+
+    if (payload.type === "SPELL_CAST") {
+      onPeerCastRef.current(payload.spellId, payload.confidence);
+      return;
     }
-  }, []);
+
+    if (payload.type === "RESTART") {
+      inGameRef.current = false;
+      setInGame(false);
+      onPeerRestartRef.current?.();
+      updateConnectionState();
+      return;
+    }
+
+    if (payload.type === "STATE_SYNC") {
+      onPeerStateSyncRef.current?.(payload.state);
+      return;
+    }
+
+    if (payload.type === "READY") {
+      remoteReadyRef.current = true;
+      setRemoteReady(true);
+      updateConnectionState();
+      return;
+    }
+
+    if (payload.type === "PING") {
+      void sendPeerEvent({ type: "PONG", timestamp: payload.timestamp });
+      return;
+    }
+
+    if (payload.type === "PONG") {
+      const nextLatency = latencyTrackerRef.current.consumePong(payload.timestamp);
+      if (nextLatency !== null) {
+        setLatencyMs(nextLatency);
+      }
+      return;
+    }
+
+    if (payload.type === "MOTION_DATA") {
+      onPeerMotionRef.current?.(payload);
+    }
+  }, [sendPeerEvent, updateConnectionState]);
 
   const setupPeerConnection = useCallback(() => {
     if (pcRef.current) {
@@ -304,28 +323,10 @@ export const useDuelWebRTC = ({
     }
 
     const pc = new RTCPeerConnection(RTC_CONFIG);
-    attachLocalTracks(pc);
-
-    pc.ontrack = (event) => {
-      let stream = remoteStreamRef.current;
-      if (!stream) {
-        stream = new MediaStream();
-        remoteStreamRef.current = stream;
-        setRemoteStream(stream);
-      }
-
-      for (const track of event.streams[0]?.getTracks?.() ?? [event.track]) {
-        if (!stream.getTracks().some((existing) => existing.id === track.id)) {
-          stream.addTrack(track);
-        }
-      }
-    };
 
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === "connected") {
         setStatus("connected");
-        setError(null);
-        signalingFailureCountRef.current = 0;
       }
       if (pc.connectionState === "disconnected") {
         offerSentRef.current = false;
@@ -343,20 +344,20 @@ export const useDuelWebRTC = ({
         const channel = event.channel;
         channelRef.current = channel;
 
-        channel.onopen = () => setStatus("connected");
-        channel.onclose = () => setStatus("failed");
-        channel.onerror = () => setStatus("failed");
+        channel.onopen = () => {
+          applyTransportReady();
+        };
+        channel.onclose = () => {
+          hasPeerTransportRef.current = false;
+          setStatus("failed");
+          updateConnectionState();
+        };
+        channel.onerror = () => {
+          setStatus("failed");
+        };
         channel.onmessage = (messageEvent) => {
-          const message = safeParseMessage(messageEvent.data);
-          if (!message) return;
-          if (message.type === "cast") {
-            onPeerCastRef.current(message.spellId);
-          }
-          if (message.type === "restart") {
-            onPeerRestartRef.current?.();
-          }
-          if (message.type === "state_sync") {
-            onPeerStateSyncRef.current?.(message.state);
+          if (typeof messageEvent.data === "string") {
+            handlePeerMessage(messageEvent.data);
           }
         };
       };
@@ -364,7 +365,7 @@ export const useDuelWebRTC = ({
 
     pcRef.current = pc;
     return pc;
-  }, [attachLocalTracks, role]);
+  }, [applyTransportReady, handlePeerMessage, role, updateConnectionState]);
 
   const ensureHostDataChannel = useCallback(() => {
     const pc = setupPeerConnection();
@@ -375,25 +376,25 @@ export const useDuelWebRTC = ({
     const channel = pc.createDataChannel("duel-events", { ordered: true });
     channelRef.current = channel;
 
-    channel.onopen = () => setStatus("connected");
-    channel.onclose = () => setStatus("failed");
-    channel.onerror = () => setStatus("failed");
+    channel.onopen = () => {
+      applyTransportReady();
+    };
+    channel.onclose = () => {
+      hasPeerTransportRef.current = false;
+      setStatus("failed");
+      updateConnectionState();
+    };
+    channel.onerror = () => {
+      setStatus("failed");
+    };
     channel.onmessage = (messageEvent) => {
-      const message = safeParseMessage(messageEvent.data);
-      if (!message) return;
-      if (message.type === "cast") {
-        onPeerCastRef.current(message.spellId);
-      }
-      if (message.type === "restart") {
-        onPeerRestartRef.current?.();
-      }
-      if (message.type === "state_sync") {
-        onPeerStateSyncRef.current?.(message.state);
+      if (typeof messageEvent.data === "string") {
+        handlePeerMessage(messageEvent.data);
       }
     };
 
     return channel;
-  }, [setupPeerConnection]);
+  }, [applyTransportReady, handlePeerMessage, setupPeerConnection, updateConnectionState]);
 
   const sendIceCandidate = useCallback(
     async (candidate: RTCIceCandidateInit) => {
@@ -427,8 +428,6 @@ export const useDuelWebRTC = ({
     try {
       ensureHostDataChannel();
       const pc = setupPeerConnection();
-      await waitForLocalStream();
-      attachLocalTracks(pc);
       pc.onicecandidate = (event) => {
         if (!event.candidate) {
           return;
@@ -451,7 +450,7 @@ export const useDuelWebRTC = ({
       setStatus("failed");
       setError("Unable to create host WebRTC offer.");
     }
-  }, [attachLocalTracks, enabled, ensureHostDataChannel, postSignal, role, roomId, sendIceCandidate, setupPeerConnection, waitForLocalStream]);
+  }, [enabled, ensureHostDataChannel, postSignal, role, roomId, sendIceCandidate, setupPeerConnection]);
 
   const handleOffer = useCallback(
     async (eventPayload: unknown) => {
@@ -467,8 +466,6 @@ export const useDuelWebRTC = ({
       try {
         const offer = eventPayload as RTCSessionDescriptionInit;
         const pc = setupPeerConnection();
-        await waitForLocalStream();
-        attachLocalTracks(pc);
         pc.onicecandidate = (event) => {
           if (!event.candidate) {
             return;
@@ -495,7 +492,7 @@ export const useDuelWebRTC = ({
         processingOfferRef.current = false;
       }
     },
-    [attachLocalTracks, enabled, flushPendingIceCandidates, postSignal, role, roomId, sendIceCandidate, setupPeerConnection, waitForLocalStream],
+    [enabled, flushPendingIceCandidates, postSignal, role, roomId, sendIceCandidate, setupPeerConnection],
   );
 
   const handleAnswer = useCallback(
@@ -561,15 +558,15 @@ export const useDuelWebRTC = ({
 
       if (!response.ok) {
         const payload = (await response.json().catch(() => null)) as { error?: string } | null;
-        const error = new Error(
+        const nextError = new Error(
           payload?.error || `Polling failed (${response.status}).`,
         ) as SignalPollingError;
         if (response.status === 404) {
-          error.code = "ROOM_NOT_FOUND";
+          nextError.code = "ROOM_NOT_FOUND";
         } else {
-          error.code = "HTTP_ERROR";
+          nextError.code = "HTTP_ERROR";
         }
-        throw error;
+        throw nextError;
       }
 
       const data = (await response.json()) as PollResponse;
@@ -579,12 +576,14 @@ export const useDuelWebRTC = ({
       setError(null);
 
       const currentStatus = statusRef.current;
-      if (currentStatus !== "connected") {
+      if (!hasPeerTransportRef.current) {
         if ((role === "host" && !data.guestPresent) || (role === "guest" && !data.hostPresent)) {
           setStatus("waiting");
         } else {
           setStatus("connecting");
         }
+      } else if (currentStatus !== "connected") {
+        setStatus("connected");
       }
 
       cursorRef.current = data.nextCursor;
@@ -601,7 +600,7 @@ export const useDuelWebRTC = ({
         }
       }
 
-      if (role === "host" && data.guestPresent && currentStatus !== "connected") {
+      if (role === "host" && data.guestPresent && !hasPeerTransportRef.current) {
         void sendOffer();
       }
     } catch (err) {
@@ -623,38 +622,78 @@ export const useDuelWebRTC = ({
     }
   }, [enabled, handleAnswer, handleIceCandidate, handleOffer, role, roomId, sendOffer]);
 
-  const sendPeerMessage = useCallback((message: PeerMessage): boolean => {
-    const channel = channelRef.current;
-    if (!channel || channel.readyState !== "open") {
-      return false;
-    }
-    channel.send(JSON.stringify(message));
-    return true;
-  }, []);
-
   const sendCast = useCallback(
-    (spellId: SpellId): boolean => sendPeerMessage({ type: "cast", spellId }),
-    [sendPeerMessage],
+    (spellId: SpellId, confidence = 1): boolean => sendPeerEvent({
+      type: "SPELL_CAST",
+      spellId,
+      confidence,
+      timestamp: Date.now(),
+    }),
+    [sendPeerEvent],
   );
 
-  const sendRestart = useCallback((): boolean => sendPeerMessage({ type: "restart" }), [sendPeerMessage]);
+  const sendRestart = useCallback((): boolean => {
+    inGameRef.current = false;
+    setInGame(false);
+    updateConnectionState();
+    return sendPeerEvent({ type: "RESTART" });
+  }, [sendPeerEvent, updateConnectionState]);
+
   const sendStateSync = useCallback(
-    (state: unknown): boolean => sendPeerMessage({ type: "state_sync", state }),
-    [sendPeerMessage],
+    (state: unknown): boolean =>
+      throttleStateSyncRef.current((payload) => {
+        void sendPeerEvent({
+          type: "STATE_SYNC",
+          state: payload,
+          timestamp: Date.now(),
+        });
+      }, state),
+    [sendPeerEvent],
   );
 
-  useEffect(() => {
-    if (!enabled || !pcRef.current) {
-      return;
-    }
+  const sendMotionData = useCallback(
+    (event: Omit<MotionDataEvent, "type" | "timestamp">): boolean =>
+      throttleMotionRef.current((payload) => {
+        void sendPeerEvent({
+          type: "MOTION_DATA",
+          segments: payload.segments,
+          velocity: payload.velocity,
+          spellId: payload.spellId,
+          timestamp: Date.now(),
+        });
+      }, event),
+    [sendPeerEvent],
+  );
 
-    const pc = pcRef.current;
-    attachLocalTracks(pc);
-  }, [attachLocalTracks, enabled, localStream]);
+  const sendReady = useCallback((): boolean => {
+    localReadyRef.current = true;
+    setLocalReady(true);
+    updateConnectionState();
+    return sendPeerEvent({ type: "READY", timestamp: Date.now() });
+  }, [sendPeerEvent, updateConnectionState]);
+
+  const startGame = useCallback(() => {
+    inGameRef.current = true;
+    setInGame(true);
+    updateConnectionState();
+  }, [updateConnectionState]);
+
+  const resetReadyState = useCallback(() => {
+    localReadyRef.current = false;
+    remoteReadyRef.current = false;
+    inGameRef.current = false;
+    setLocalReady(false);
+    setRemoteReady(false);
+    setInGame(false);
+    setLatencyMs(null);
+    latencyTrackerRef.current.reset();
+    updateConnectionState();
+  }, [updateConnectionState]);
 
   useEffect(() => {
     if (!enabled) {
       setStatus("idle");
+      setConnectionState("DISCONNECTED");
       return;
     }
 
@@ -664,6 +703,9 @@ export const useDuelWebRTC = ({
     offerSentRef.current = false;
     signalingFailureCountRef.current = 0;
     roomUnavailableRef.current = false;
+    hasPeerTransportRef.current = false;
+
+    resetReadyState();
 
     void markPresence(true);
     void pollSignalEvents();
@@ -677,10 +719,47 @@ export const useDuelWebRTC = ({
         window.clearInterval(pollTimerRef.current);
         pollTimerRef.current = null;
       }
+      if (pingTimerRef.current !== null) {
+        window.clearInterval(pingTimerRef.current);
+        pingTimerRef.current = null;
+      }
       closePeer();
       void markPresence(false);
     };
-  }, [closePeer, enabled, markPresence, pollSignalEvents]);
+  }, [closePeer, enabled, markPresence, pollSignalEvents, resetReadyState]);
+
+  useEffect(() => {
+    if (!enabled || !hasPeerTransportRef.current) {
+      if (pingTimerRef.current !== null) {
+        window.clearInterval(pingTimerRef.current);
+        pingTimerRef.current = null;
+      }
+      return;
+    }
+
+    const sendPing = () => {
+      const timestamp = Date.now();
+      latencyTrackerRef.current.markPing(timestamp);
+      void sendPeerEvent({ type: "PING", timestamp });
+    };
+
+    sendPing();
+    pingTimerRef.current = window.setInterval(sendPing, PING_INTERVAL_MS);
+
+    return () => {
+      if (pingTimerRef.current !== null) {
+        window.clearInterval(pingTimerRef.current);
+        pingTimerRef.current = null;
+      }
+    };
+  }, [enabled, sendPeerEvent, status]);
+
+  useEffect(() => {
+    updateConnectionState();
+  }, [enabled, hostPresent, guestPresent, status, updateConnectionState]);
+
+  const isConnected = hasPeerTransportRef.current;
+  const bothReady = localReady && remoteReady;
 
   return {
     status,
@@ -691,9 +770,19 @@ export const useDuelWebRTC = ({
     sendCast,
     sendRestart,
     sendStateSync,
+    sendMotionData,
+    sendReady,
+    startGame,
+    resetReadyState,
     localAlias,
     remoteAlias,
-    remoteStream,
-    isConnected: status === "connected",
+    isConnected,
+    localReady,
+    remoteReady,
+    bothReady,
+    inGame,
+    connectionState,
+    latencyMs,
+    latencyQuality: getLatencyQuality(latencyMs),
   };
 };

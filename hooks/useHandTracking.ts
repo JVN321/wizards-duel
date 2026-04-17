@@ -130,6 +130,7 @@ const ensureHandsScript = async (): Promise<void> => {
 export const useHandTracking = (
   settings: TrackingSettings,
   onFrame?: (frame: TrackingFrame) => void,
+  enabled = true,
 ) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -335,6 +336,12 @@ export const useHandTracking = (
   }, [settings]);
 
   useEffect(() => {
+    if (!enabled) {
+      stop();
+      setIsReady(false);
+      return;
+    }
+
     void start();
     return () => {
       stop();
@@ -343,7 +350,7 @@ export const useHandTracking = (
         handsRef.current = null;
       }
     };
-  }, [start, stop]);
+  }, [enabled, start, stop]);
 
   return {
     videoRef,

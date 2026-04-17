@@ -110,6 +110,31 @@ body {
   inset: 0;
 }
 
+.training-guide-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  display: grid;
+  place-items: center;
+}
+
+.training-guide-svg {
+  width: min(72%, 460px);
+  height: min(72%, 460px);
+}
+
+.training-guide-path {
+  fill: none;
+  stroke: var(--guide-color, #7de8ff);
+  stroke-width: 5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.28;
+  filter: drop-shadow(0 0 10px color-mix(in srgb, var(--guide-color, #7de8ff) 75%, transparent));
+  stroke-dasharray: 4 8;
+}
+
 /* ─── Overlays ─────────────────────────────────────────────────────────────── */
 .overlay-center {
   position: absolute;
@@ -117,6 +142,31 @@ body {
   display: grid;
   place-items: center;
   background: rgba(4, 8, 15, 0.82);
+  backdrop-filter: blur(6px);
+}
+
+.connection-overlay {
+  background: rgba(4, 8, 15, 0.72);
+  z-index: 7;
+}
+
+.mouse-mode-overlay {
+  background: transparent;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.mouse-mode-indicator {
+  position: absolute;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 6;
+  pointer-events: none;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(76, 242, 255, 0.35);
+  background: rgba(4, 8, 15, 0.45);
   backdrop-filter: blur(6px);
 }
 
@@ -217,6 +267,7 @@ body {
   left: 0;
   right: 0;
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 10px 14px;
   background: rgba(4, 8, 15, 0.75);
@@ -274,6 +325,10 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.2em;
   margin-top: 4px;
+}
+
+.latency-row {
+  color: #9de9ff;
 }
 
 .camera-duel-grid {

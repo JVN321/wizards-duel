@@ -9,7 +9,7 @@
  *   - Continuously receives trail points via `feed()`
  *   - No pause-to-cast: runs recognition on a sliding window
  *   - Debounce cooldown prevents the same spell firing multiple times
- *   - Protego Maxima is pose-based and runs separately
+ *   - Protego Maxima is a circle-trace gesture and runs separately
  *   - Returns a SpellMatch | null on each `recognize()` call
  * ─────────────────────────────────────────────────────────────────────────────
  */
@@ -27,7 +27,6 @@ import {
   pathLength,
 } from "@/utils/gestureUtils";
 import type { LandmarkLike } from "@/utils/motionGesture";
-import { computeLandmarkVelocity } from "@/utils/motionGesture";
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
 
@@ -118,8 +117,8 @@ export class MotionRecognizer {
     const s = this.settings;
     const now = Date.now();
 
-    // ── Protego Maxima (pose-based, no trail needed) ───────────────────────
-    const protegoMaximaResult = this.tryProtegoMaxima(landmarks, now);
+    // ── Protego Maxima (circle-trace gesture) ──────────────────────────────
+    const protegoMaximaResult = this.tryProtegoMaxima(this.trail, now);
     if (protegoMaximaResult) return protegoMaximaResult;
 
     // ── Trail-based detectors ──────────────────────────────────────────────
@@ -155,7 +154,7 @@ export class MotionRecognizer {
     return null;
   }
 
-  /** Update landmarks for Protego Maxima / palm tracking */
+  /** Update landmarks for future landmark-based detectors */
   updateLandmarks(landmarks: LandmarkLike[], timestamp: number): void {
     this.prevLandmarks = landmarks;
     this.prevLandmarkTime = timestamp;
@@ -163,49 +162,27 @@ export class MotionRecognizer {
 
   // ── Private helpers ────────────────────────────────────────────────────────
 
-  private tryProtegoMaxima(
-    landmarks: LandmarkLike[],
-    now: number,
-  ): SpellMatch | null {
+  private tryProtegoMaxima(points: Point[], now: number): SpellMatch | null {
     const s = this.settings;
 
-    if (landmarks.length < 21) {
-      this.palmHoldStart = null;
-      return null;
-    }
-
-    // Landmark velocity check (is the hand still?)
-    const dtMs =
-      this.prevLandmarkTime !== null ? now - this.prevLandmarkTime : 0;
-    const vel = computeLandmarkVelocity(this.prevLandmarks, landmarks, dtMs);
-
     const spell = SPELL_REGISTRY["protego_maxima"];
-    const poseScore = spell.detect([], landmarks);
-
-    if (poseScore === null || vel > s.palmStillThreshold) {
-      this.palmHoldStart = null;
-      return null;
-    }
-
-    // Start or continue palm hold timer
-    if (this.palmHoldStart === null) {
-      this.palmHoldStart = now;
-      return null;
-    }
-
-    const held = now - this.palmHoldStart;
-    if (held < s.palmHoldMs) return null;
+    if (points.length < 15) return null;
 
     // Check debounce
     const lastCast = this.lastCastAt["protego_maxima"] ?? 0;
     if (now - lastCast < s.castDebounceMs * 3) return null;
 
+    const confidence = spell.detect(points, []);
+    if (confidence === null || confidence <= 0) {
+      return null;
+    }
+
     this.lastCastAt["protego_maxima"] = now;
-    this.palmHoldStart = null;
+    this.trail = [];
 
     return {
       spell,
-      confidence: Math.min(1, 0.75 + held / (s.palmHoldMs * 2) * 0.25),
+      confidence,
       detectedAt: now,
     };
   }
