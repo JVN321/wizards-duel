@@ -40,12 +40,12 @@ export default function DuelRoomPage() {
   }
 
   return (
-    <main className="relative min-h-screen overflow-hidden bg-slate-950 text-slate-100">
+    <main className="relative flex h-screen flex-col overflow-hidden bg-slate-950 text-slate-100">
       <div className="pointer-events-none absolute -left-24 -top-24 h-72 w-72 rounded-full bg-cyan-500/18 blur-3xl" />
       <div className="pointer-events-none absolute -right-24 top-16 h-80 w-80 rounded-full bg-fuchsia-500/14 blur-3xl" />
 
       <div className="relative border-b border-cyan-200/15 bg-slate-900/80 px-4 py-3 backdrop-blur sm:px-6">
-        <div className="mx-auto flex w-full max-w-[1380px] items-center justify-between gap-3">
+        <div className="mx-auto flex w-full max-w-345 items-center justify-between gap-3">
           <button
             type="button"
             onClick={() => router.push("/")}
@@ -62,7 +62,7 @@ export default function DuelRoomPage() {
         </div>
       </div>
 
-      <div className="relative">
+      <div className="relative min-h-0 flex-1">
         <HandTracker
           multiplayer={{
             enabled: true,

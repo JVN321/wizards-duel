@@ -30,8 +30,9 @@ import { getAllSpells } from "@/utils/spellRegistry";
 import { useDuelWebRTC } from "@/hooks/useDuelWebRTC";
 import { getConnectionBanner } from "@/utils/connectionState";
 import type { SpellCastEvent } from "@/utils/networkManager";
-import { evaluateSpellProbabilities } from "@/utils/probabilityEvaluator";
+import { evaluateSpellTemplateProbabilities } from "@/utils/spellTemplateMatcher";
 import {
+  DEFAULT_DUEL_SETTINGS,
   deriveRecognizerSettings,
   deriveTrackingSettings,
   loadDuelSettings,
@@ -78,6 +79,9 @@ const START_DELAY_MS = 650;
 const TRAINING_MIN_POINTS = 10;
 const TRAINING_MAX_ATTEMPT_MS = 2300;
 const DEFAULT_PROBABILITY_REFRESH_MS = 80;
+const MOUSE_TEMPLATE_THRESHOLD_SCALE = 0.52;
+const CV_TEMPLATE_THRESHOLD_SCALE = 0.68;
+const MIN_DETECTION_CONFIDENCE = 0.5;
 
 const mapHostStateToGuestView = (hostState: GameState): GameState => ({
   ...hostState,
@@ -162,7 +166,10 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
   const trainingResetTimerRef = useRef<number | null>(null);
   const latestLandmarksRef = useRef<TrackingFrame["landmarks"]>(null);
   const lastProbabilityAtRef = useRef(0);
+  const lastShapeRecognizeAtRef = useRef(0);
   const lastMousePointRef = useRef<Point | null>(null);
+  const mouseGestureActiveRef = useRef(false);
+  const localCooldownsRef = useRef<Partial<Record<SpellId, number>>>({});
 
   // ── State ───────────────────────────────────────────────────────────────────
   const [trail, setTrail] = useState<Point[]>([]);
@@ -175,7 +182,8 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
   const [opponentCastFeedback, setOpponentCastFeedback] = useState<SpellDefinition | null>(null);
   const [clockMs, setClockMs] = useState(() => Date.now());
   const [showSettingsPanel, setShowSettingsPanel] = useState(false);
-  const [settings, setSettings] = useState<DuelSettings>(() => loadDuelSettings());
+  const [settings, setSettings] = useState<DuelSettings>(DEFAULT_DUEL_SETTINGS);
+  const [settingsReady, setSettingsReady] = useState(false);
   const [selectedSpellId, setSelectedSpellId] = useState<string>(() => getAllSpells()[0]?.id ?? "");
   const [isDrawing, setIsDrawing] = useState(false);
   const [trainingStatus, setTrainingStatus] = useState<TrainingStatus>("ready");
@@ -204,15 +212,23 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
   const recognizerSettings = useMemo(() => deriveRecognizerSettings(settings), [settings]);
 
   useEffect(() => {
+    setSettings(loadDuelSettings());
+    setSettingsReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (!settingsReady) {
+      return;
+    }
     saveDuelSettings(settings);
-  }, [settings]);
+  }, [settings, settingsReady]);
 
   useEffect(() => {
     recognizerRef.current.updateSettings(recognizerSettings);
   }, [recognizerSettings]);
 
   useEffect(() => {
-    engineRef.current.setConfidenceFloor(settings.detection.confidenceThreshold);
+    engineRef.current.setConfidenceFloor(Math.max(MIN_DETECTION_CONFIDENCE, settings.detection.confidenceThreshold));
   }, [settings.detection.confidenceThreshold]);
 
   const clearTrainingResetTimer = useCallback(() => {
@@ -240,31 +256,32 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
   }, []);
 
   const detectSpecificSpell = useCallback((path: Point[], frameLandmarks: TrackingFrame["landmarks"]) => {
+    void frameLandmarks;
     if (!selectedSpell || path.length < TRAINING_MIN_POINTS) {
       return null;
     }
 
-    const cleaned = filterByMinDistance(path, 5);
-    if (cleaned.length < TRAINING_MIN_POINTS) {
+    const ranked = evaluateSpellTemplateProbabilities(path);
+    const selected = ranked.find((entry) => entry.spell.id === selectedSpell.id);
+    if (!selected) {
       return null;
     }
 
-    const smoothed = smoothPath(cleaned, settings.detection.smoothingFactor);
-    if (smoothed.length < TRAINING_MIN_POINTS) {
-      return null;
-    }
+    const thresholdScale = inputMode === "MOUSE" ? MOUSE_TEMPLATE_THRESHOLD_SCALE : CV_TEMPLATE_THRESHOLD_SCALE;
+    const threshold = Math.max(MIN_DETECTION_CONFIDENCE, settings.detection.confidenceThreshold * thresholdScale);
+    return selected.confidence >= threshold ? selected.confidence : null;
+  }, [
+    inputMode,
+    selectedSpell,
+    settings.detection.confidenceThreshold,
+  ]);
 
-    const normalized = normalizeGestureInput(smoothed, {
-      resamplePoints: 96,
-      targetSize: 220,
+  const getShapeSpellProbabilities = useCallback((rawPath: Point[], limit?: number) => {
+    return evaluateSpellTemplateProbabilities(rawPath, {
+      limit,
+      gridSize: 30,
     });
-    const confidence = selectedSpell.detect(normalized, frameLandmarks ?? []);
-    if (confidence === null || confidence < settings.detection.confidenceThreshold) {
-      return null;
-    }
-
-    return Math.min(1, confidence);
-  }, [selectedSpell, settings.detection.confidenceThreshold, settings.detection.smoothingFactor]);
+  }, []);
 
   const success = useCallback((spell: SpellDefinition, confidence: number) => {
     clearTrainingResetTimer();
@@ -347,20 +364,17 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     }
     lastProbabilityAtRef.current = now;
 
-    const ranked = evaluateSpellProbabilities(path, frameLandmarks, {
-      minStrokeLength: settings.detection.minimumGestureLength,
-      smoothingFactor: settings.detection.smoothingFactor,
-      minMovement: recognizerSettings.minMovement,
-      limit: 1,
-    });
+    const ranked = getShapeSpellProbabilities(path, 1);
 
     const best = ranked[0];
-    if (!best || best.confidence < 0.12) {
+    if (!best) {
       setTopProbability(null);
       return;
     }
     setTopProbability(best);
-  }, [recognizerSettings.minMovement, settings.detection.minimumGestureLength, settings.detection.smoothingFactor]);
+  }, [
+    getShapeSpellProbabilities,
+  ]);
 
   const toggleTrainingMode = useCallback(() => {
     const nextMode: TrainingModeState = currentTrainingMode === "LEARNING" ? "FREE" : "LEARNING";
@@ -404,6 +418,21 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     setFeedback(null);
     setFlashProgress(0);
     setTopProbability(null);
+    localCooldownsRef.current = {};
+  }, []);
+
+  const isSpellCoolingDownLocally = useCallback((spellId: SpellId, now = Date.now()) => {
+    const stateReadyAt = gameState.cooldowns[spellId] ?? 0;
+    const localReadyAt = localCooldownsRef.current[spellId] ?? 0;
+    return now < Math.max(stateReadyAt, localReadyAt);
+  }, [gameState.cooldowns]);
+
+  const markSpellCooldownLocal = useCallback((spellId: SpellId, now = Date.now()) => {
+    const spell = getAllSpells().find((s) => s.id === spellId);
+    if (!spell) {
+      return;
+    }
+    localCooldownsRef.current[spellId] = now + spell.cooldownMs;
   }, []);
 
   const processHostCastEvent = useCallback((event: SpellCastEvent): boolean => {
@@ -696,23 +725,38 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
           return prev;
         });
 
-        const match = recognizer.recognize(frameLandmarks ?? []);
-        if (match) {
-          setFeedback({
-            spell: match.spell,
-            confidence: match.confidence,
-            at: Date.now(),
-            source: "player",
-          });
-          setTrainingStatus("success");
-          setFeedbackMessage(`Detected: ${match.spell.displayName}`);
-          setTrail([]);
-          trailRef.current = [];
-          recognizer.clearTrail();
-          setTopProbability(null);
-          setSegments([]);
-          setIsDrawing(false);
-          playSpellTone(match.spell.soundFrequencies, match.spell.soundWave);
+        if (inputMode === "CV") {
+          const recognitionIntervalMs = Math.max(16, Math.round(1000 / settings.detection.recognitionFrequencyHz));
+          let match: { spell: SpellDefinition; confidence: number } | null = null;
+          if (pointTime - lastShapeRecognizeAtRef.current >= recognitionIntervalMs) {
+            lastShapeRecognizeAtRef.current = pointTime;
+            const ranked = getShapeSpellProbabilities(trailRef.current, 1);
+            const cvThreshold = Math.max(MIN_DETECTION_CONFIDENCE, settings.detection.confidenceThreshold * CV_TEMPLATE_THRESHOLD_SCALE);
+            if (ranked[0] && ranked[0].confidence >= cvThreshold) {
+              match = {
+                spell: ranked[0].spell,
+                confidence: ranked[0].confidence,
+              };
+            }
+          }
+
+          if (match) {
+            setFeedback({
+              spell: match.spell,
+              confidence: match.confidence,
+              at: Date.now(),
+              source: "player",
+            });
+            setTrainingStatus("success");
+            setFeedbackMessage(`Detected: ${match.spell.displayName}`);
+            setTrail([]);
+            trailRef.current = [];
+            recognizer.clearTrail();
+            setTopProbability(null);
+            setSegments([]);
+            setIsDrawing(false);
+            playSpellTone(match.spell.soundFrequencies, match.spell.soundWave);
+          }
         }
 
         if (!showDebug || pointTime - lastSegmentComputeAtRef.current < SEGMENT_REFRESH_MS) {
@@ -752,10 +796,12 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
         updateProbabilityFeedback(nextTrailRef, frameLandmarks);
       }
 
-      const liveConfidence = detectSpecificSpell(nextTrailRef, frameLandmarks);
-      if (liveConfidence !== null) {
-        success(selectedSpell, liveConfidence);
-        return;
+      if (inputMode === "CV") {
+        const liveConfidence = detectSpecificSpell(nextTrailRef, frameLandmarks);
+        if (liveConfidence !== null) {
+          success(selectedSpell, liveConfidence);
+          return;
+        }
       }
 
       if (!showDebug || pointTime - lastSegmentComputeAtRef.current < SEGMENT_REFRESH_MS) {
@@ -787,10 +833,25 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
       return prev;
     });
 
-    const match = recognizer.recognize(frameLandmarks ?? []);
+    const recognitionIntervalMs = Math.max(16, Math.round(1000 / settings.detection.recognitionFrequencyHz));
+    let match: { spell: SpellDefinition; confidence: number } | null = null;
+    if (inputMode === "CV" && pointTime - lastShapeRecognizeAtRef.current >= recognitionIntervalMs) {
+      lastShapeRecognizeAtRef.current = pointTime;
+      const ranked = getShapeSpellProbabilities(trailRef.current, 1);
+      const cvThreshold = Math.max(MIN_DETECTION_CONFIDENCE, settings.detection.confidenceThreshold * CV_TEMPLATE_THRESHOLD_SCALE);
+      if (ranked[0] && ranked[0].confidence >= cvThreshold) {
+        match = {
+          spell: ranked[0].spell,
+          confidence: ranked[0].confidence,
+        };
+      }
+    }
 
     if (match) {
       const spell = match.spell;
+      if (isSpellCoolingDownLocally(spell.id)) {
+        return;
+      }
       setTrail([]);
       trailRef.current = [];
       recognizer.clearTrail();
@@ -809,11 +870,21 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
           });
           sendCastRef.current(spell.id, normalizedConfidence, eventTimestamp);
         } else {
+          markSpellCooldownLocal(spell.id, eventTimestamp);
+          setFeedback({
+            spell,
+            confidence: normalizedConfidence,
+            at: Date.now(),
+            source: "player",
+          });
+          playSpellTone(spell.soundFrequencies, spell.soundWave);
+          addToast(`✨ ${spell.displayName}`, spell.color);
           sendCastRef.current(spell.id, normalizedConfidence, eventTimestamp);
         }
       } else {
         const cast = engine.castSpell(spell.id, match.confidence);
         if (cast) {
+          markSpellCooldownLocal(spell.id);
           setFeedback({
             spell,
             confidence: match.confidence,
@@ -845,12 +916,18 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     currentTrainingMode,
     detectSpecificSpell,
     detectionEnabled,
+    getShapeSpellProbabilities,
     isDrawing,
     isTrainingMode,
+    inputMode,
     multiplayerEnabled,
     processHostCastEvent,
     role,
+    isSpellCoolingDownLocally,
+    markSpellCooldownLocal,
     selectedSpell,
+    settings.detection.confidenceThreshold,
+    settings.detection.recognitionFrequencyHz,
     settings.detection.smoothingFactor,
     settings.trail.trailLength,
     showDebug,
@@ -999,9 +1076,188 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
   }, [isConnected, localReady, localTrackingReady, multiplayerEnabled, sendReady]);
 
   // ── Mouse casting mode ───────────────────────────────────────────────────
+  const startMouseGesture = useCallback(() => {
+    mouseGestureActiveRef.current = true;
+    setTrail([]);
+    trailRef.current = [];
+    recognizerRef.current.clearTrail();
+    setSegments([]);
+    setTopProbability(null);
+    lastMousePointRef.current = null;
+    lastObservedPointRef.current = null;
+    lastObservedTimeRef.current = null;
+    dropoutStartRef.current = null;
+
+    if (isTrainingMode && currentTrainingMode === "LEARNING") {
+      trainingAttemptStartRef.current = performance.now();
+      setIsDrawing(true);
+    }
+  }, [currentTrainingMode, isTrainingMode]);
+
+  const endMouseGesture = useCallback(() => {
+    if (!mouseGestureActiveRef.current) {
+      return;
+    }
+
+    mouseGestureActiveRef.current = false;
+    lastMousePointRef.current = null;
+    lastObservedPointRef.current = null;
+    lastObservedTimeRef.current = null;
+
+    const recognizer = recognizerRef.current;
+    const engine = engineRef.current;
+
+    if (isTrainingMode && currentTrainingMode === "LEARNING") {
+      if (trailRef.current.length > 0) {
+        handleGestureEnd(trailRef.current, null);
+      } else {
+        setIsDrawing(false);
+      }
+      return;
+    }
+
+    if (isTrainingMode && currentTrainingMode === "FREE") {
+      const ranked = getShapeSpellProbabilities(trailRef.current, 1);
+      const mouseThreshold = Math.max(MIN_DETECTION_CONFIDENCE, settings.detection.confidenceThreshold * MOUSE_TEMPLATE_THRESHOLD_SCALE);
+      const match = ranked[0] && ranked[0].confidence >= mouseThreshold
+        ? {
+          spell: ranked[0].spell,
+          confidence: ranked[0].confidence,
+        }
+        : null;
+      if (match) {
+        setFeedback({
+          spell: match.spell,
+          confidence: match.confidence,
+          at: Date.now(),
+          source: "player",
+        });
+        setTrainingStatus("success");
+        setFeedbackMessage(`Detected: ${match.spell.displayName}`);
+        playSpellTone(match.spell.soundFrequencies, match.spell.soundWave);
+      }
+
+      setTrail([]);
+      trailRef.current = [];
+      recognizer.clearTrail();
+      setSegments([]);
+      setTopProbability(null);
+      setIsDrawing(false);
+      return;
+    }
+
+    if (detectionEnabled) {
+      const ranked = getShapeSpellProbabilities(trailRef.current, 1);
+      const mouseThreshold = Math.max(MIN_DETECTION_CONFIDENCE, settings.detection.confidenceThreshold * MOUSE_TEMPLATE_THRESHOLD_SCALE);
+      const match = ranked[0] && ranked[0].confidence >= mouseThreshold
+        ? {
+          spell: ranked[0].spell,
+          confidence: ranked[0].confidence,
+        }
+        : null;
+      if (match) {
+        const spell = match.spell;
+        if (isSpellCoolingDownLocally(spell.id)) {
+          setTrail([]);
+          trailRef.current = [];
+          recognizer.clearTrail();
+          setSegments([]);
+          setTopProbability(null);
+          setIsDrawing(false);
+          return;
+        }
+
+        if (multiplayerEnabled) {
+          const eventTimestamp = Date.now();
+          const normalizedConfidence = Math.max(0, Math.min(1, match.confidence));
+          if (role === "host") {
+            processHostCastEvent({
+              type: "CAST_SPELL",
+              spellId: spell.id,
+              timestamp: eventTimestamp,
+              confidence: normalizedConfidence,
+              playerId: "host",
+            });
+            sendCastRef.current(spell.id, normalizedConfidence, eventTimestamp);
+          } else {
+            markSpellCooldownLocal(spell.id, eventTimestamp);
+            setFeedback({
+              spell,
+              confidence: normalizedConfidence,
+              at: Date.now(),
+              source: "player",
+            });
+            playSpellTone(spell.soundFrequencies, spell.soundWave);
+            addToast(`✨ ${spell.displayName}`, spell.color);
+            sendCastRef.current(spell.id, normalizedConfidence, eventTimestamp);
+          }
+        } else {
+          const cast = engine.castSpell(spell.id, match.confidence);
+          if (cast) {
+            markSpellCooldownLocal(spell.id);
+            setFeedback({
+              spell,
+              confidence: match.confidence,
+              at: Date.now(),
+              source: "player",
+            });
+            playSpellTone(spell.soundFrequencies, spell.soundWave);
+            addToast(`✨ ${spell.displayName}`, spell.color);
+          }
+        }
+      }
+    }
+
+    setTrail([]);
+    trailRef.current = [];
+    recognizer.clearTrail();
+    setSegments([]);
+    setTopProbability(null);
+    setIsDrawing(false);
+  }, [
+    addToast,
+    currentTrainingMode,
+    detectionEnabled,
+    getShapeSpellProbabilities,
+    handleGestureEnd,
+    isSpellCoolingDownLocally,
+    isTrainingMode,
+    markSpellCooldownLocal,
+    multiplayerEnabled,
+    processHostCastEvent,
+    role,
+    settings.detection.confidenceThreshold,
+  ]);
+
+  const handleMouseDown = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (inputMode !== "MOUSE" || !detectionEnabled || event.button !== 0) {
+      return;
+    }
+
+    startMouseGesture();
+  }, [detectionEnabled, inputMode, startMouseGesture]);
+
+  const handleMouseUp = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (inputMode !== "MOUSE" || event.button !== 0) {
+      return;
+    }
+
+    endMouseGesture();
+  }, [endMouseGesture, inputMode]);
+
   const handleMouseMove = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
     if (inputMode !== "MOUSE" || !detectionEnabled) {
       return;
+    }
+
+    const isLeftButtonDown = (event.buttons & 1) === 1;
+    if (!isLeftButtonDown) {
+      endMouseGesture();
+      return;
+    }
+
+    if (!mouseGestureActiveRef.current) {
+      startMouseGesture();
     }
 
     const frame = frameRef.current;
@@ -1053,21 +1309,23 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     );
   }, [
     detectionEnabled,
+    endMouseGesture,
     inputMode,
     isMirrored,
     processMotionPoint,
     settings.input.mouse.smoothing,
     settings.input.mouse.speedScaling,
+    startMouseGesture,
     videoSize.height,
     videoSize.width,
   ]);
 
   const handleMouseLeave = useCallback(() => {
-    if (!isTrainingMode || currentTrainingMode !== "LEARNING" || inputMode !== "MOUSE" || !isDrawing) {
+    if (inputMode !== "MOUSE") {
       return;
     }
-    handleGestureEnd(trailRef.current, null);
-  }, [currentTrainingMode, handleGestureEnd, inputMode, isDrawing, isTrainingMode]);
+    endMouseGesture();
+  }, [endMouseGesture, inputMode]);
 
   // ── Keep preview synced for local camera-only monitor ───────────────────
   useEffect(() => {
@@ -1100,6 +1358,8 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
 
   const activeSpellColor = feedback?.spell.color ?? null;
   const trainingAccuracy = attemptCount > 0 ? Math.round((successCount / attemptCount) * 100) : 0;
+  const alwaysVisibleProbability = topProbability
+    ?? (selectedSpell ? { spell: selectedSpell, confidence: 0 } : null);
   const handleSettingsChange = useCallback((next: DuelSettings) => {
     const sanitized = sanitizeDuelSettings(next);
     if (sanitized.input.mode !== settings.input.mode) {
@@ -1109,12 +1369,77 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     setSettings(sanitized);
   }, [settings.input.mode]);
 
+  const quickSetInputMode = useCallback((mode: "CV" | "MOUSE") => {
+    if (settings.input.mode === mode) {
+      return;
+    }
+    handleSettingsChange({
+      ...settings,
+      input: {
+        ...settings.input,
+        mode,
+      },
+    });
+  }, [handleSettingsChange, settings]);
+
+  const handleRestartDuel = useCallback(() => {
+    if (isTrainingMode) {
+      clearTrainingResetTimer();
+      resetTrainingState(selectedSpell ? `Selected ${selectedSpell.displayName}. Draw the gesture to cast` : "Draw the gesture to cast");
+      return;
+    }
+
+    if (multiplayerEnabled) {
+      if (!bothReady) {
+        addToast("Both players must be ready to restart.", "#ffb670");
+        return;
+      }
+      if (role === "host") {
+        engineRef.current.startDuel("multiplayer", {
+          playerName: localAlias,
+          opponentName: remoteAlias,
+        });
+        const nextState = { ...engineRef.current.getState() };
+        setGameState(nextState);
+        void sendStateUpdateRef.current(nextState);
+        console.log("SYNC STATE:", nextState);
+      }
+      void sendRestart();
+      startGame();
+    } else {
+      engineRef.current.startDuel(duelMode);
+    }
+    handleClear();
+  }, [
+    addToast,
+    bothReady,
+    clearTrainingResetTimer,
+    duelMode,
+    handleClear,
+    isTrainingMode,
+    localAlias,
+    multiplayerEnabled,
+    remoteAlias,
+    resetTrainingState,
+    role,
+    selectedSpell,
+    sendRestart,
+    startGame,
+  ]);
+
   return (
     <div className="duel-root">
       {/* ── Video / Canvas area ── */}
       <div className="video-section">
         <div className="video-inner">
-          <div className="video-frame" ref={frameRef} onMouseMove={handleMouseMove} onMouseLeave={handleMouseLeave}>
+          <div
+            className="video-frame"
+            ref={frameRef}
+            onMouseDown={handleMouseDown}
+            onMouseUp={handleMouseUp}
+            onMouseMove={handleMouseMove}
+            onMouseLeave={handleMouseLeave}
+          >
             {inputMode === "CV" && (
               <video
                 ref={videoRef}
@@ -1211,21 +1536,11 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
 
             <div className="fps-badge">{fps} FPS</div>
 
-            {topProbability && !feedback && (
+            {alwaysVisibleProbability && (
               <div className="probability-badge">
-                Likely: {topProbability.spell.displayName} ({(topProbability.confidence * 100).toFixed(0)}%)
+                Detection: {alwaysVisibleProbability.spell.displayName} ({(alwaysVisibleProbability.confidence * 100).toFixed(0)}%)
               </div>
             )}
-
-            <button
-              type="button"
-              onClick={() => setShowSettingsPanel((prev) => !prev)}
-              className="settings-fab"
-              aria-label="Toggle settings panel"
-              aria-expanded={showSettingsPanel}
-            >
-              ⚙
-            </button>
 
             {showSettingsPanel && (
               <div className="settings-popover" role="dialog" aria-label="Gesture settings">
@@ -1250,35 +1565,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  if (isTrainingMode) {
-                    clearTrainingResetTimer();
-                    resetTrainingState(selectedSpell ? `Selected ${selectedSpell.displayName}. Draw the gesture to cast` : "Draw the gesture to cast");
-                    return;
-                  }
-
-                  if (multiplayerEnabled) {
-                    if (!bothReady) {
-                      addToast("Both players must be ready to restart.", "#ffb670");
-                      return;
-                    }
-                    if (role === "host") {
-                      engineRef.current.startDuel("multiplayer", {
-                        playerName: localAlias,
-                        opponentName: remoteAlias,
-                      });
-                      const nextState = { ...engineRef.current.getState() };
-                      setGameState(nextState);
-                      void sendStateUpdateRef.current(nextState);
-                      console.log("SYNC STATE:", nextState);
-                    }
-                    void sendRestart();
-                    startGame();
-                  } else {
-                    engineRef.current.startDuel(duelMode);
-                  }
-                  handleClear();
-                }}
+                onClick={handleRestartDuel}
                 className="btn-restart"
               >
                 {isTrainingMode ? "Reset Training" : "Restart Duel"}
@@ -1292,6 +1579,30 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
                   {currentTrainingMode === "LEARNING" ? "Switch to Free Mode" : "Switch to Learning Mode"}
                 </button>
               )}
+              <div className="controls-spacer" />
+              <button
+                type="button"
+                onClick={() => quickSetInputMode("CV")}
+                className={`btn-debug ${settings.input.mode === "CV" ? "btn-debug-on" : ""}`}
+              >
+                Camera Mode
+              </button>
+              <button
+                type="button"
+                onClick={() => quickSetInputMode("MOUSE")}
+                className={`btn-debug ${settings.input.mode === "MOUSE" ? "btn-debug-on" : ""}`}
+              >
+                Mouse Mode
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowSettingsPanel((prev) => !prev)}
+                className={`btn-debug ${showSettingsPanel ? "btn-debug-on" : ""}`}
+                aria-label="Toggle settings panel"
+                aria-expanded={showSettingsPanel}
+              >
+                {showSettingsPanel ? "Close Settings" : "Open Settings"}
+              </button>
             </div>
           </div>
         </div>
@@ -1393,7 +1704,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
           />
         ) : (
           <>
-            <HealthBars gameState={gameState} />
+            <HealthBars gameState={gameState} onRematch={handleRestartDuel} />
             <ComboMeter gameState={gameState} now={clockMs} />
             <SpellGrid gameState={gameState} currentFeedback={feedback} now={clockMs} />
             <EffectList gameState={gameState} now={clockMs} />
@@ -1418,7 +1729,13 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
 
-function HealthBars({ gameState }: { gameState: GameState }) {
+function HealthBars({
+  gameState,
+  onRematch,
+}: {
+  gameState: GameState;
+  onRematch?: () => void;
+}) {
   const { player, opponent } = gameState;
   const playerPct = (player.hp / player.maxHp) * 100;
   const opponentPct = (opponent.hp / opponent.maxHp) * 100;
@@ -1464,10 +1781,24 @@ function HealthBars({ gameState }: { gameState: GameState }) {
       )}
 
       {gameState.phase === "victory" && (
-        <div className="phase-badge phase-win">🏆 Victory!</div>
+        <>
+          <div className="phase-badge phase-win">🏆 Victory!</div>
+          {onRematch && (
+            <button type="button" className="phase-rematch-btn" onClick={onRematch}>
+              Rematch
+            </button>
+          )}
+        </>
       )}
       {gameState.phase === "defeat" && (
-        <div className="phase-badge phase-loss">💀 Defeated</div>
+        <>
+          <div className="phase-badge phase-loss">💀 Defeated</div>
+          {onRematch && (
+            <button type="button" className="phase-rematch-btn" onClick={onRematch}>
+              Rematch
+            </button>
+          )}
+        </>
       )}
     </div>
   );

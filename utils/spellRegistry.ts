@@ -474,37 +474,45 @@ function detectProtegoMaxima(
  * Distinguishable from Protego by being SHORT and FAST.
  */
 function detectLumos(points: Point[]): number | null {
-  if (points.length < 6) return null;
+  if (points.length < 5) return null;
   const dur = pathDurationMs(points);
-  if (dur < 180 || dur > 1000) return null;
+  if (dur < 90 || dur > 1700) return null;
 
-  const segs = segmentPath(points, { ...BASE_CFG, minSegmentLength: 32 });
+  const segs = segmentPath(points, { ...BASE_CFG, minSegmentLength: 16 });
   if (segs.length < 2) return null;
 
   let vScore = 0;
   for (let i = 0; i < segs.length - 1; i++) {
     const a = segs[i].direction;
     const b = segs[i + 1].direction;
-    const isCaret =
-      (a === "DIAG_UL" || a === "DIAG_UR")
-      && (b === "DIAG_DL" || b === "DIAG_DR");
-    if (!isCaret) continue;
+    const isDiagonalA = a.startsWith("DIAG_");
+    const isDiagonalB = b.startsWith("DIAG_");
+    if (!isDiagonalA || !isDiagonalB) continue;
+
+    const aEndsUp = a === "DIAG_UL" || a === "DIAG_UR";
+    const bEndsUp = b === "DIAG_UL" || b === "DIAG_UR";
+    const hasOppositeVerticalFlow = aEndsUp !== bEndsUp;
+    if (!hasOppositeVerticalFlow) continue;
 
     const lenScore = Math.min(1, (segs[i].length + segs[i + 1].length) / 160);
     const turn = orthogonalTurnScore(segs[i], segs[i + 1]);
-    vScore = Math.max(vScore, 0.6 * lenScore + 0.4 * turn);
+    vScore = Math.max(vScore, 0.52 * lenScore + 0.48 * turn);
   }
 
-  if (vScore < 0.5) return null;
+  if (vScore < 0.22) return null;
 
   const { width, height } = getBounds(points);
-  if (height < 30 || width < 18) return null;
-  if (height < width * 0.8) return null;
+  if (height < 18 || width < 10) return null;
+  if (height < width * 0.45) return null;
 
   const vel = avgVelocity(points);
-  if (vel < 0.1 || vel > 0.65) return null;
+  if (vel < 0.03 || vel > 1.15) return null;
 
-  return vScore;
+  const compactness = Math.min(1, Math.max(width, height) / 180);
+  const velScore = Math.min(1, vel / 0.35);
+  const score = 0.55 * vScore + 0.25 * compactness + 0.2 * velScore;
+
+  return score > 0.18 ? score : null;
 }
 
 /*
@@ -515,9 +523,9 @@ function detectLumos(points: Point[]): number | null {
 function detectNox(points: Point[]): number | null {
   if (points.length < 6) return null;
   const dur = pathDurationMs(points);
-  if (dur < 200 || dur > 1200) return null;
+  if (dur < 150 || dur > 1400) return null;
 
-  const hasArc = detectArc(points, 95, BASE_CFG);
+  const hasArc = detectArc(points, 72, BASE_CFG);
   if (!hasArc) return null;
 
   const segs = segmentPath(points, BASE_CFG);
@@ -526,18 +534,19 @@ function detectNox(points: Point[]): number | null {
       s.direction === "RIGHT"
       || s.direction === "LEFT"
       || s.direction === "DIAG_DR"
+      || s.direction === "DIAG_DL"
       || s.direction === "DIAG_UR",
   );
   if (!hasTail) return null;
 
   const sweep = Math.abs(totalAngularSweep(points));
-  if (sweep < 95 || sweep > 330) return null;
+  if (sweep < 70 || sweep > 360) return null;
 
   const length = pathLength(points);
-  if (length > 280) return null;
+  if (length > 340) return null;
 
   const score = Math.min(1, sweep / 220);
-  return score > 0.45 ? score : null;
+  return score > 0.32 ? score : null;
 }
 
 /*
@@ -548,7 +557,7 @@ function detectNox(points: Point[]): number | null {
 function detectPetrificusTotalus(points: Point[]): number | null {
   if (points.length < 9) return null;
   const duration = pathDurationMs(points);
-  if (duration < 260 || duration > 1800) return null;
+  if (duration < 220 || duration > 2200) return null;
 
   const segs = segmentPath(points, BASE_CFG);
   if (segs.length < 2) return null;
@@ -558,12 +567,19 @@ function detectPetrificusTotalus(points: Point[]): number | null {
   if (firstArcIdx < 0) return null;
 
   const sweep = Math.abs(totalAngularSweep(points));
-  if (sweep < 140 || sweep > 430) return null;
+  if (sweep < 110 || sweep > 470) return null;
 
   // After the hook-curve, require a pronounced straight tail.
   const afterArc = segs.slice(firstArcIdx + 1);
   const linearAfter = afterArc.find(
-    (s) => !s.isCurved && (s.direction === "RIGHT" || s.direction === "LEFT") && s.length >= 65,
+    (s) => !s.isCurved
+      && (
+        s.direction === "RIGHT"
+        || s.direction === "LEFT"
+        || s.direction === "UP"
+        || s.direction === "DOWN"
+      )
+      && s.length >= 50,
   );
   if (!linearAfter) return null;
 
@@ -571,7 +587,7 @@ function detectPetrificusTotalus(points: Point[]): number | null {
   const arcScore = Math.min(1, Math.abs(arcSeg.totalAngleChange) / 1.6);
   const linScore = Math.min(1, linearAfter.length / 120);
   const score = 0.45 * arcScore + 0.55 * linScore;
-  return score > 0.5 ? score : null;
+  return score > 0.4 ? score : null;
 }
 
 // ─── Spell registry ───────────────────────────────────────────────────────────
